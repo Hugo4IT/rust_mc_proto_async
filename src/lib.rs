@@ -5,12 +5,11 @@ use std::{
     fmt,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
 };
 use uuid::Uuid;
+
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(test)]
 mod tests;
@@ -70,7 +69,7 @@ impl Zigzag<i128> for u128 {
 }
 impl Zigzag<usize> for isize {
     fn zigzag(&self) -> usize {
-        ((self << 1) ^ (self >> std::mem::size_of::<usize>() - 1)) as usize
+        ((self << 1) ^ (self >> (std::mem::size_of::<usize>() - 1))) as usize
     }
 }
 impl Zigzag<isize> for usize {
@@ -585,6 +584,11 @@ impl Packet {
         self.buffer.len()
     }
 
+    /// Same as `packet.len() == 0`
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Get buffer bytes
     pub fn get_bytes(&self) -> Vec<u8> {
         self.buffer.as_bytes().to_vec()
@@ -611,9 +615,9 @@ impl DataBufferWriter for Packet {
 }
 
 /// Minecraft connection, wrapper for stream with compression
-pub struct MinecraftConnection<T: Read + Write> {
+pub struct MinecraftConnection<T> {
     stream: T,
-    compression: Arc<AtomicUsize>,
+    compression_threshold: Option<usize>,
     compression_type: u32,
 }
 
@@ -628,14 +632,14 @@ impl MinecraftConnection<TcpStream> {
             Err(_) => return Err(ProtocolError::AddressParseError),
         };
 
-        let stream: TcpStream = match TcpStream::connect(&addr) {
+        let stream: TcpStream = match TcpStream::connect(addr) {
             Ok(i) => i,
             Err(_) => return Err(ProtocolError::StreamConnectError),
         };
 
         Ok(MinecraftConnection {
             stream,
-            compression: Arc::new(AtomicUsize::new(usize::MAX)),
+            compression_threshold: None,
             compression_type: 1,
         })
     }
@@ -650,8 +654,8 @@ impl MinecraftConnection<TcpStream> {
         match self.stream.try_clone() {
             Ok(stream) => Ok(MinecraftConnection {
                 stream,
-                compression: self.compression.clone(),
-                compression_type: 1,
+                compression_threshold: self.compression_threshold,
+                compression_type: self.compression_type,
             }),
             _ => Err(ProtocolError::CloneError),
         }
@@ -677,40 +681,29 @@ impl<T: Read + Write> DataBufferWriter for MinecraftConnection<T> {
     }
 }
 
-impl<T: Read + Write> MinecraftConnection<T> {
+impl<T> MinecraftConnection<T> {
     /// Create new MinecraftConnection from stream
     pub fn new(stream: T) -> MinecraftConnection<T> {
         MinecraftConnection {
             stream,
-            compression: Arc::new(AtomicUsize::new(usize::MAX)),
+            compression_threshold: None,
             compression_type: 1,
         }
     }
 
     /// Set compression threshold
     pub fn set_compression(&mut self, threshold: Option<usize>) {
-        self.compression.store(
-            match threshold {
-                Some(t) => t,
-                None => usize::MAX,
-            },
-            Ordering::Relaxed,
-        );
+        self.compression_threshold = threshold;
     }
 
     /// Get compression threshold
     pub fn compression(&self) -> Option<usize> {
-        let threshold = self.compression.load(Ordering::Relaxed);
-        if threshold == usize::MAX {
-            None
-        } else {
-            Some(threshold)
-        }
+        self.compression_threshold
     }
 
     /// Set compression type
     ///
-    /// `compression_type` is integer from 0 (none) to 9 (longest)
+    /// `compression_type` is integer from 0 (none) to 9 (slowest)
     /// 1 is fast compression
     /// 6 is normal compression
     pub fn set_compression_type(&mut self, compression_type: u32) {
@@ -719,7 +712,7 @@ impl<T: Read + Write> MinecraftConnection<T> {
 
     /// Get compression type
     ///
-    /// `compression_type` is integer from 0 (none) to 9 (longest)
+    /// `compression_type` is integer from 0 (none) to 9 (slowest)
     /// 1 is fast compression
     /// 6 is normal compression
     pub fn compression_type(&self) -> u32 {
@@ -735,34 +728,50 @@ impl<T: Read + Write> MinecraftConnection<T> {
     pub fn get_ref(&self) -> &T {
         &self.stream
     }
+}
 
+impl<T: Read + Write> MinecraftConnection<T> {
     /// Read [`Packet`](Packet) from connection
     pub fn read_packet(&mut self) -> Result<Packet, ProtocolError> {
-        read_packet_atomic(
-            &mut self.stream,
-            self.compression.clone(),
-            Ordering::Relaxed,
-        )
+        read_packet(&mut self.stream, self.compression_threshold)
     }
 
     /// Write [`Packet`](Packet) to connection
     pub fn write_packet(&mut self, packet: &Packet) -> Result<(), ProtocolError> {
-        write_packet_atomic(
+        write_packet(
             &mut self.stream,
-            self.compression.clone(),
-            Ordering::Relaxed,
+            self.compression_threshold,
             self.compression_type,
             packet,
         )
     }
 }
 
-impl<T: Read + Write + Clone> MinecraftConnection<T> {
+#[cfg(feature = "tokio")]
+impl<T: AsyncRead + AsyncWrite + Unpin> MinecraftConnection<T> {
+    /// Read [`Packet`](Packet) from connection
+    pub async fn read_packet_async(&mut self) -> Result<Packet, ProtocolError> {
+        read_packet_async(&mut self.stream, self.compression_threshold).await
+    }
+
+    /// Write [`Packet`](Packet) to connection
+    pub async fn write_packet_async(&mut self, packet: &Packet) -> Result<(), ProtocolError> {
+        write_packet_async(
+            &mut self.stream,
+            self.compression_threshold,
+            self.compression_type,
+            packet,
+        )
+        .await
+    }
+}
+
+impl<T: Clone> MinecraftConnection<T> {
     /// Clone MinecraftConnection with compression and stream
     pub fn clone(&mut self) -> MinecraftConnection<T> {
         MinecraftConnection {
             stream: self.stream.clone(),
-            compression: self.compression.clone(),
+            compression_threshold: self.compression_threshold,
             compression_type: self.compression_type,
         }
     }
@@ -795,18 +804,15 @@ pub type MCConnTcp = MinecraftConnection<TcpStream>;
 /// usize::MAX means that compression is disabled
 ///
 /// `ordering` is order how to load atomic
-pub fn read_packet_atomic<T: Read>(
+pub fn read_packet<T: Read>(
     stream: &mut T,
-    compression: Arc<AtomicUsize>,
-    ordering: Ordering,
+    compression_threshold: Option<usize>,
 ) -> Result<Packet, ProtocolError> {
     let mut data: Vec<u8>;
 
     let packet_length = stream.read_usize_varint_size()?;
 
-    let compress_threashold = compression.load(ordering);
-
-    if compress_threashold != usize::MAX {
+    if compression_threshold.is_some() {
         let data_length = stream.read_usize_varint_size()?;
 
         data = stream.read_bytes(packet_length.0 - data_length.1)?;
@@ -818,7 +824,7 @@ pub fn read_packet_atomic<T: Read>(
         data = stream.read_bytes(packet_length.0)?;
     }
 
-    Ok(Packet::from_data(&data)?)
+    Packet::from_data(&data)
 }
 
 /// Write [`Packet`](Packet) to stream
@@ -831,10 +837,9 @@ pub fn read_packet_atomic<T: Read>(
 /// `compression_type` is integer from 0 (none) to 9 (longest)
 /// 1 is fast compression
 /// 6 is normal compression
-pub fn write_packet_atomic<T: Write>(
+pub fn write_packet<T: Write>(
     stream: &mut T,
-    compression: Arc<AtomicUsize>,
-    ordering: Ordering,
+    compression_threshold: Option<usize>,
     compression_type: u32,
     packet: &Packet,
 ) -> Result<(), ProtocolError> {
@@ -844,12 +849,10 @@ pub fn write_packet_atomic<T: Write>(
     data_buf.write_u8_varint(packet.id)?;
     data_buf.write_buffer(&packet.buffer)?;
 
-    let compress_threshold = compression.load(ordering);
-
-    if compress_threshold != usize::MAX {
+    if let Some(compression_threshold) = compression_threshold {
         let mut packet_buf = ByteBuffer::new();
 
-        if data_buf.len() >= compress_threshold {
+        if data_buf.len() >= compression_threshold {
             let compressed_data = compress_zlib(data_buf.as_bytes(), compression_type)?;
             packet_buf.write_usize_varint(data_buf.len())?;
             packet_buf
@@ -870,4 +873,122 @@ pub fn write_packet_atomic<T: Write>(
     stream.write_buffer(&buf)?;
 
     Ok(())
+}
+
+#[cfg(feature = "tokio")]
+async fn read_usize_varint_size_async<T: AsyncRead + Unpin>(
+    stream: &mut T,
+) -> Result<(usize, usize), ProtocolError> {
+    let mut shift: usize = 0;
+    let mut decoded: usize = 0;
+    let mut size: usize = 0;
+
+    loop {
+        let next = stream.read_u8().await.or(Err(ProtocolError::VarIntError))?;
+        size += 1;
+
+        if shift >= (std::mem::size_of::<usize>() * 8) {
+            return Err(ProtocolError::VarIntError);
+        }
+
+        decoded |= ((next & 0b01111111) as usize) << shift;
+
+        if next & 0b10000000 == 0b10000000 {
+            shift += 7;
+        } else {
+            return Ok((decoded, size));
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+/// Read [`Packet`](Packet) from stream
+///
+/// `compression` here is atomic usize
+/// usize::MAX means that compression is disabled
+///
+/// `ordering` is order how to load atomic
+pub async fn read_packet_async<T: AsyncRead + Unpin>(
+    stream: &mut T,
+    compression_threshold: Option<usize>,
+) -> Result<Packet, ProtocolError> {
+    let packet_length = read_usize_varint_size_async(stream).await?;
+
+    let data = if compression_threshold.is_some() {
+        let data_length = read_usize_varint_size_async(stream).await?;
+
+        let mut data = vec![0u8; packet_length.0 - data_length.1];
+
+        stream
+            .read_exact(&mut data)
+            .await
+            .or(Err(ProtocolError::DataRanOutError))?;
+
+        if data_length.0 != 0 {
+            data = decompress_zlib(&data)?;
+        }
+
+        data
+    } else {
+        let mut data = vec![0u8; packet_length.0];
+
+        stream
+            .read_exact(&mut data)
+            .await
+            .or(Err(ProtocolError::DataRanOutError))?;
+
+        data
+    };
+
+    Packet::from_data(&data)
+}
+
+#[cfg(feature = "tokio")]
+/// Write [`Packet`](Packet) to stream
+///
+/// `compression` here is atomic usize
+/// usize::MAX means that compression is disabled
+///
+/// `ordering` is order how to load atomic
+///
+/// `compression_type` is integer from 0 (none) to 9 (longest)
+/// 1 is fast compression
+/// 6 is normal compression
+pub async fn write_packet_async<T: AsyncWrite + Unpin>(
+    stream: &mut T,
+    compression_threshold: Option<usize>,
+    compression_type: u32,
+    packet: &Packet,
+) -> Result<(), ProtocolError> {
+    let mut buf = ByteBuffer::new();
+
+    let mut data_buf = ByteBuffer::new();
+    data_buf.write_u8_varint(packet.id)?;
+    data_buf.write_buffer(&packet.buffer)?;
+
+    if let Some(compression_threshold) = compression_threshold {
+        let mut packet_buf = ByteBuffer::new();
+
+        if data_buf.len() >= compression_threshold {
+            let compressed_data = compress_zlib(data_buf.as_bytes(), compression_type)?;
+            packet_buf.write_usize_varint(data_buf.len())?;
+            packet_buf
+                .write_all(&compressed_data)
+                .or(Err(ProtocolError::WriteError))?;
+        } else {
+            packet_buf.write_usize_varint(0)?;
+            packet_buf.write_buffer(&data_buf)?;
+        }
+
+        buf.write_usize_varint(packet_buf.len())?;
+        buf.write_buffer(&packet_buf)?;
+    } else {
+        buf.write_usize_varint(data_buf.len())?;
+        buf.write_buffer(&data_buf)?;
+    }
+
+    stream
+        .write_all(buf.as_bytes())
+        .await
+        .or(Err(ProtocolError::WriteError))
 }
